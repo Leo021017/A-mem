@@ -13,20 +13,25 @@ from sentence_transformers import SentenceTransformer
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+import os
 from openai import OpenAI
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
 from sentence_transformers.util import pytorch_cos_sim
 
-# Download required NLTK data
+# 直接使用项目自带的 nltk_data（避免 nltk.download 联网卡死）
+_REPO_NLTK_DATA = os.path.join(os.path.dirname(__file__), "nltk_data")
+nltk.data.path.insert(0, _REPO_NLTK_DATA)
 try:
-    nltk.download('punkt', quiet=True)
-    nltk.download('wordnet', quiet=True)
-except Exception as e:
-    print(f"Error downloading NLTK data: {e}")
+    nltk.data.find("tokenizers/punkt")
+    nltk.data.find("corpora/wordnet")
+except LookupError as e:
+    raise RuntimeError(
+        f"未在项目路径找到 NLTK 资源：{_REPO_NLTK_DATA}（缺 punkt/wordnet）。"
+    ) from e
 
 # Initialize SentenceTransformer model (this will be reused)
 try:
-    sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+    sentence_model = SentenceTransformer('all-MiniLM-L6-v2', local_files_only=True)
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None

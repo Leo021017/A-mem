@@ -10,9 +10,7 @@ Key differences from the original:
   - Graceful degradation: evolution failure -> memory stored without evolution
 """
 
-from typing import List, Dict, Optional, Literal, Any
-import json
-import re
+from typing import List, Dict, Optional, Literal
 import uuid
 import os
 import time
@@ -21,7 +19,7 @@ import functools
 from datetime import datetime
 from abc import ABC, abstractmethod
 
-from memory_layer import SimpleEmbeddingRetriever, simple_tokenize
+from memory_layer import SimpleEmbeddingRetriever
 from llm_text_parsers import (
     ANALYZE_CONTENT_PROMPT,
     EVOLUTION_DECISION_PROMPT,
@@ -34,6 +32,7 @@ from llm_text_parsers import (
     parse_update_neighbors,
     validate_analysis_result,
 )
+from retrieve_atention import retrieve_attention
 
 logger = logging.getLogger("amem_robust")
 
@@ -95,17 +94,36 @@ class RobustBaseLLMController(ABC):
 
 
 class RobustOpenAIController(RobustBaseLLMController):
-    def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None):
+    def __init__(
+        self,
+        model: str = "gpt-4",
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+    ):
         try:
             from openai import OpenAI
         except ImportError:
             raise ImportError("OpenAI package not found. Install it with: pip install openai")
         self.model = model
+
+        # If using DeepSeek via OpenAI-compatible API, auto-route by model prefix.
+        # Example model names: "deepseek-chat", "deepseek-reasoner", etc.
+        is_deepseek = str(model).lower().startswith("deepseek")
+        if is_deepseek and api_base is None:
+            api_base = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/")
         if api_key is None:
-            api_key = os.getenv('OPENAI_API_KEY')
+            api_key = os.getenv("DEEPSEEK_API_KEY" if is_deepseek else "OPENAI_API_KEY")
         if api_key is None:
-            raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
-        self.client = OpenAI(api_key=api_key)
+            raise ValueError(
+                "API key not found. Set DEEPSEEK_API_KEY (for deepseek*) or OPENAI_API_KEY."
+            )
+
+        client_kwargs = {"api_key": api_key}
+        if api_base:
+            client_kwargs["base_url"] = api_base
+        self.client = OpenAI(**client_kwargs)
+        # Expose last usage for prompt token length stats.
+        self.last_prompt_tokens: Optional[int] = None
 
     @retry_llm_call(max_retries=2)
     def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
@@ -118,6 +136,10 @@ class RobustOpenAIController(RobustBaseLLMController):
             temperature=temperature,
             max_tokens=1000,
         )
+        try:
+            self.last_prompt_tokens = int(getattr(response, "usage").prompt_tokens)  # type: ignore[attr-defined]
+        except Exception:
+            self.last_prompt_tokens = None
         return response.choices[0].message.content
 
 
@@ -206,36 +228,6 @@ class RobustVLLMController(RobustBaseLLMController):
         raise RuntimeError(f"vLLM server returned status {response.status_code}: {response.text}")
 
 
-class RobustLiteLLMController(RobustBaseLLMController):
-    """LiteLLM controller for universal LLM access (Ollama, SGLang, etc.)."""
-
-    def __init__(self, model: str, api_base: Optional[str] = None,
-                 api_key: Optional[str] = None):
-        from litellm import completion as _completion
-        self._completion = _completion
-        self.model = model
-        self.api_base = api_base
-        self.api_key = api_key or "EMPTY"
-
-    @retry_llm_call(max_retries=2)
-    def get_completion(self, prompt: str, temperature: float = 0.7) -> str:
-        completion_args = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.SYSTEM_MESSAGE},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": temperature,
-        }
-        if self.api_base:
-            completion_args["api_base"] = self.api_base
-        if self.api_key:
-            completion_args["api_key"] = self.api_key
-
-        response = self._completion(**completion_args)
-        return response.choices[0].message.content
-
-
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -252,7 +244,8 @@ class RobustLLMController:
                  sglang_port: int = 30000,
                  check_connection: bool = False):
         if backend == "openai":
-            self.llm = RobustOpenAIController(model, api_key)
+            # Auto-route DeepSeek models by prefix (deepseek*) to api_base.
+            self.llm = RobustOpenAIController(model, api_key, api_base)
         elif backend == "ollama":
             self.llm = RobustOllamaController(model)
         elif backend == "sglang":
@@ -427,7 +420,14 @@ class RobustAgenticMemorySystem:
             )
         return memory_str, indices
 
-    def find_related_memories_raw(self, query: str, k: int = 5) -> str:
+    def find_related_memories_raw(
+        self,
+        query: str,
+        k: int = 5,
+        use_attention: bool = True,
+        attention_model_name: Optional[str] = None,
+        attention_max_length: int = 4096,
+    ) -> str:
         """Find related memories with neighborhood expansion."""
         if not self.memories:
             return ""
@@ -456,7 +456,17 @@ class RobustAgenticMemorySystem:
                 if j >= k:
                     break
                 j += 1
-        return memory_str
+
+        if not use_attention:
+            return memory_str
+
+        return retrieve_attention(
+            query,
+            memory_str,
+            topp=0.3,
+            model_name=attention_model_name or "/data/hyc/models/Qwen2.5-14B-Instruct",
+            max_length=attention_max_length,
+        )
 
     # ---- evolution (3 sequential plain-text calls) ----
 
