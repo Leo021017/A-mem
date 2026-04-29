@@ -6,6 +6,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 
 _WS_RE = re.compile(r"\s+")
+USE_SELECTIVE_ATTENTION_IMPL = False
 
 _HF_CACHE: Dict[str, Tuple[object, object, torch.device]] = {}
 
@@ -133,34 +134,69 @@ def _transformer_attention_select(
     if ctx_len <= 0 or q_end <= q_start:
         raise RuntimeError("query/context token 切分失败（可能输入为空或被截断）。")
 
-    enc = {"input_ids": torch.tensor([input_ids], device=device)}
-    if tokenizer.pad_token_id is not None:
-        enc["attention_mask"] = torch.ones_like(enc["input_ids"], device=device)
+    # 可选：优先尝试 llama_select 的 selective_attention 接口，
+    # 通过外部 score buffer 收集各层 query->key 累计分数，避免全量 attention map。
+    # 若模型不支持该接口，则自动回退到通用实现。
+    total_len = len(input_ids)
+    query_ids: List[int] = input_ids[q_start:q_end]
 
-    with torch.no_grad():
-        out = model(**enc, output_attentions=True)
-    attentions = out.attentions  # tuple[num_layers] of (batch, heads, seq, seq)
-    if not attentions:
-        raise RuntimeError(
-            "模型未返回 attentions。通常是 transformers 使用了 sdpa/flash attention。"
-            "请确认已强制 attn_implementation='eager'，或使用支持 output_attentions 的注意力实现。"
-        )
+    scores: Optional[torch.Tensor] = None
+    if USE_SELECTIVE_ATTENTION_IMPL:
+        score_buf = torch.zeros(total_len, device=device, dtype=torch.float32)
+        full_t = torch.tensor([input_ids], device=device, dtype=torch.long)
+        full_mask = torch.ones((1, total_len), device=device, dtype=torch.long)
+        try:
+            with torch.no_grad():
+                _ = model(
+                    input_ids=full_t,
+                    attention_mask=full_mask,
+                    use_cache=False,
+                    output_attentions=False,
+                    selective_attention=True,
+                    selective_query_start=q_start,
+                    collect_attention_scores=True,
+                    attention_score_buffer=score_buf,
+                    context_length=ctx_end,
+                )
+            scores = score_buf.detach().cpu()
+        except (TypeError, ValueError, RuntimeError):
+            # 不支持 selective_attention 的模型，回退到通用实现。
+            scores = None
 
-    query_idx = list(range(q_start, q_end))
+    if scores is None:
+        # 回退到原始实现：一次前向拿 full attention map，再裁剪 query->context 子块。
+        enc = {"input_ids": torch.tensor([input_ids], device=device)}
+        if tokenizer.pad_token_id is not None:
+            enc["attention_mask"] = torch.ones_like(enc["input_ids"], device=device)
+        with torch.no_grad():
+            out = model(**enc, output_attentions=True)
+
+        # tuple[num_layers] of (batch, heads, seq, seq)
+        attentions = out.attentions
+        if not attentions:
+            raise RuntimeError(
+                "模型未返回 attentions。通常是 transformers 使用了 sdpa/flash attention。"
+                "请确认已强制 attn_implementation='eager'，或使用支持 output_attentions 的注意力实现。"
+            )
+
+        query_idx = list(range(q_start, q_end))
+        if not query_idx:
+            raise RuntimeError("query token 索引为空，无法从 full attention 中切片。")
+
+        # 计算每个 key token 的累积注意力分数（仅由 query 行贡献）
+        # decoder-only: score[s] = sum_layers mean_heads sum_{t in query} attn[t, s]
+        # 这里不显式使用 query->query 分数，后续只在 context 列上取 topk。
+        scores = torch.zeros(total_len, dtype=torch.float32)
+        for layer_attn in attentions:
+            # (heads, seq, seq)
+            a = layer_attn[0]  # batch 0
+            a = a.mean(dim=0)  # head 之间取平均，得到 (seq, seq)
+            # query 行求和，得到每个 key token 的累计被关注强度
+            scores += a[query_idx, :].sum(dim=0).detach().cpu()
+
     ctx_idx = list(range(ctx_start, min(ctx_start + ctx_len, ctx_end)))
-    if not query_idx or not ctx_idx:
+    if not query_ids or not ctx_idx:
         raise RuntimeError("query/context token 切分失败（可能是输入被截断或 tokenizer 行为异常）。")
-
-    # 计算每个 context token 的累积注意力分数
-    # decoder-only: score[s] = sum_layers mean_heads sum_{t in query} attn[t, s]
-    seq_len = len(input_ids)
-    scores = torch.zeros(seq_len, dtype=torch.float32)
-    for layer_attn in attentions:
-        # (heads, seq, seq)
-        a = layer_attn[0]  # batch 0
-        a = a.mean(dim=0)  # head 之间取平均，得到 (seq, seq)
-        # 只给 context token 累积分数：被 query 关注越多，分数越高
-        scores += a[query_idx, :].sum(dim=0).detach().cpu()
 
     ctx_scores = [(i, float(scores[i].item())) for i in ctx_idx]
     ctx_scores.sort(key=lambda x: x[1], reverse=True)
@@ -202,6 +238,8 @@ def retrieve_attention(
     - **topp**: 0~1 之间，表示保留的 context token 比例（默认 0.3）。
     - **model_name**: 用于 attention 的本地 transformer。
     - **max_length**: pair 编码最大长度（包含 query+context+special tokens）。
+    - **USE_SELECTIVE_ATTENTION_IMPL**: 通过文件内全局变量控制是否优先尝试
+      llama_select 的 selective 注意力接口（默认 False）。
     """
     text = _transformer_attention_select(
         query=query,
